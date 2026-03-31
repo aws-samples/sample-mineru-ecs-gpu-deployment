@@ -1,0 +1,760 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MinerU ECS Infrastructure - VPC, ECS Cluster, Auto Scaling with GPU Support'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mineru-ecs
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+  
+  # VPC Configuration
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for VPC
+    AllowedPattern: ^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/(1[6-9]|2[0-8]))$
+  
+  # ECS Configuration
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: 
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - g4dn.xlarge
+      - g4dn.2xlarge
+      - g4dn.4xlarge
+      - g4dn.8xlarge
+      - g4dn.12xlarge
+      - g4dn.16xlarge
+    Description: EC2 instance type for ECS cluster
+  
+  MinSize:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Minimum number of instances in Auto Scaling Group
+  
+  MaxSize:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: Maximum number of instances in Auto Scaling Group
+  
+  DesiredCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Desired number of instances in Auto Scaling Group
+  
+  VolumeSize:
+    Type: Number
+    Default: 100
+    MinValue: 30
+    MaxValue: 1000
+    Description: EBS volume size in GB
+
+  # Debug and troubleshooting parameters
+  DebugMode:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Enable debug mode to skip CloudFormation signal waiting.
+      This prevents stack rollback for troubleshooting purposes.
+      
+  DisableRollback:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Disable automatic rollback on failure.
+      Useful for debugging deployment issues.
+
+  # Container Configuration
+  ContainerImage:
+    Type: String
+    Default: 'public.ecr.aws/b1v8r5t6/mineru-ecs-gpu:latest'
+    Description: |
+      Container image to pre-pull during instance initialization.
+      This helps reduce ECS task startup time for large images.
+  
+  # Key Pair (optional)
+  KeyPairName:
+    Type: String
+    Default: ''
+    Description: EC2 Key Pair name for SSH access (optional)
+
+Conditions:
+  # Condition to check if we should wait for CloudFormation signals
+  WaitForSignals: !Equals [!Ref DebugMode, 'false']
+  
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, '']]
+  IsGPUInstance: !Or
+    - !Equals [!Ref InstanceType, 'g4dn.xlarge']
+    - !Equals [!Ref InstanceType, 'g4dn.2xlarge']
+    - !Equals [!Ref InstanceType, 'g4dn.4xlarge']
+    - !Equals [!Ref InstanceType, 'g4dn.8xlarge']
+    - !Equals [!Ref InstanceType, 'g4dn.12xlarge']
+    - !Equals [!Ref InstanceType, 'g4dn.16xlarge']
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-vpc'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Internet Gateway
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-igw'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref VPC
+
+  # Public Subnets
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-subnet-1'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-subnet-2'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # Private Subnets
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-subnet-1'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-subnet-2'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # NAT Gateways
+  NatGateway1EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-eip-1'
+
+  NatGateway2EIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-eip-2'
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway1EIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-1'
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGateway2EIP.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-nat-2'
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-public-routes'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-routes-1'
+
+  DefaultPrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-private-routes-2'
+
+  DefaultPrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      SubnetId: !Ref PrivateSubnet2
+
+  # Security Groups
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-ecs-sg'
+      GroupDescription: Security group for ECS instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 32768
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-alb-sg'
+      GroupDescription: Security group for Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # IAM Role for ECS Instances
+  ECSInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: CloudFormationSignaling
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                  - ecs:ListContainerInstances
+                  - ecs:DescribeContainerInstances
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ECSInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${ProjectName}-${Environment}-ecs-instance-profile'
+      Roles:
+        - !Ref ECSInstanceRole
+
+  # ECS Cluster (简化版本，不预先指定容量提供者)
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-cluster'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Launch Template
+  ECSLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${ProjectName}-${Environment}-ecs-launch-template'
+      LaunchTemplateData:
+        # Use SSM Parameter Store to dynamically resolve the latest ECS-optimized AL2023 AMI
+        # This ensures you always get the latest AMI with security patches on each stack update
+        # AL2023 is supported through 2028 (replacing AL2 which reaches EOL on June 30, 2026)
+        ImageId: !If 
+          - IsGPUInstance
+          - !Sub '{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id}}'
+          - !Sub '{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/recommended/image_id}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref 'AWS::NoValue']
+        IamInstanceProfile:
+          Arn: !GetAtt ECSInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref ECSSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              # Optimize for large container images (11GB+)
+              Iops: 3000  # Higher IOPS for faster image pull and extraction
+              Throughput: 125  # Higher throughput for large file operations
+              DeleteOnTermination: true
+              Encrypted: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -x
+            exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+            
+            echo "Starting user data script at $(date)"
+            echo "ECS Cluster: ${ECSCluster}"
+            echo "Debug Mode: ${DebugMode}"
+            
+            # Update system (yum works on AL2023 as a dnf alias)
+            echo "Updating system packages..."
+            yum update -y
+            
+            # AWS CLI v2 is pre-installed on AL2023 ECS-optimized AMI
+            echo "AWS CLI version: $(aws --version)"
+            
+            # Note: ECS cluster is guaranteed to be ready due to CloudFormation DependsOn
+            echo "ECS cluster ${ECSCluster} should be ready (ensured by CloudFormation dependencies)"
+            
+            # Verify ECS cluster is accessible
+            echo "Verifying ECS cluster accessibility..."
+            cluster_status=$(aws ecs describe-clusters --clusters ${ECSCluster} --region ${AWS::Region} --query 'clusters[0].status' --output text 2>/dev/null || echo "ERROR")
+            
+            if [ "$cluster_status" = "ACTIVE" ]; then
+                echo "✅ ECS cluster ${ECSCluster} is ACTIVE and accessible"
+            else
+                echo "⚠️  ECS cluster status: $cluster_status"
+                echo "Proceeding with ECS agent configuration anyway..."
+            fi
+            
+            # Configure ECS
+            echo "Configuring ECS agent..."
+            echo ECS_CLUSTER=${ECSCluster} > /etc/ecs/ecs.config
+            echo ECS_ENABLE_GPU_SUPPORT=true >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_CONTAINER_METADATA=true >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_TASK_IAM_ROLE=true >> /etc/ecs/ecs.config
+            echo ECS_ENABLE_TASK_IAM_ROLE_NETWORK_HOST=true >> /etc/ecs/ecs.config
+            echo ECS_AVAILABLE_LOGGING_DRIVERS=[\"json-file\",\"awslogs\"] >> /etc/ecs/ecs.config
+            echo ECS_LOGLEVEL=info >> /etc/ecs/ecs.config
+            
+            # Show ECS config for debugging
+            echo "ECS configuration:"
+            cat /etc/ecs/ecs.config
+            
+            # ECS-optimized AMI will automatically start ECS agent and register with cluster
+            echo "✅ ECS configuration completed"
+            echo "Note: ECS agent will auto-start and register with cluster ${ECSCluster}"
+            
+            # Configure Docker for large container images
+            echo "Configuring Docker for large container images..."
+            mkdir -p /etc/docker
+            echo '{' > /etc/docker/daemon.json
+            echo '  "storage-driver": "overlay2",' >> /etc/docker/daemon.json
+            echo '  "log-driver": "json-file",' >> /etc/docker/daemon.json
+            echo '  "log-opts": {' >> /etc/docker/daemon.json
+            echo '    "max-size": "10m",' >> /etc/docker/daemon.json
+            echo '    "max-file": "3"' >> /etc/docker/daemon.json
+            echo '  },' >> /etc/docker/daemon.json
+            echo '  "max-concurrent-downloads": 10,' >> /etc/docker/daemon.json
+            echo '  "max-concurrent-uploads": 5' >> /etc/docker/daemon.json
+            echo '}' >> /etc/docker/daemon.json
+            
+            systemctl enable docker
+            systemctl start docker
+            
+            # Wait for Docker to be ready
+            echo "Waiting for Docker to be ready..."
+            docker_ready_timeout=300
+            docker_ready_counter=0
+            while [ $docker_ready_counter -lt $docker_ready_timeout ]; do
+                if docker info >/dev/null 2>&1; then
+                    echo "✅ Docker daemon is ready"
+                    break
+                fi
+                echo "Waiting for Docker daemon to be ready... ($docker_ready_counter/$docker_ready_timeout seconds)"
+                sleep 5
+                docker_ready_counter=$((docker_ready_counter + 5))
+            done
+            
+            if ! docker info >/dev/null 2>&1; then
+                echo "❌ ERROR: Docker daemon failed to start properly"
+                systemctl status docker
+                signal_result=1
+            else
+                echo "✅ Docker daemon is running successfully"
+                signal_result=0
+            fi
+            
+            # Send signal to CloudFormation (only if not in debug mode)
+            if [ "${DebugMode}" = "false" ]; then
+                echo "Sending signal to CloudFormation with result: $signal_result"
+                # Try different possible locations for cfn-signal
+                if command -v cfn-signal >/dev/null 2>&1; then
+                    cfn-signal -e $signal_result --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+                elif [ -f /opt/aws/bin/cfn-signal ]; then
+                    /opt/aws/bin/cfn-signal -e $signal_result --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+                elif [ -f /usr/local/bin/cfn-signal ]; then
+                    /usr/local/bin/cfn-signal -e $signal_result --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+                else
+                    echo "❌ ERROR: cfn-signal not found in expected locations"
+                    # Try to install it
+                    yum install -y aws-cfn-bootstrap
+                    if command -v cfn-signal >/dev/null 2>&1; then
+                        cfn-signal -e $signal_result --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+                    else
+                        echo "❌ ERROR: Failed to install or find cfn-signal"
+                        signal_result=1
+                    fi
+                fi
+            else
+                echo "DEBUG MODE: Skipping CloudFormation signal. Result would be: $signal_result"
+                echo "DEBUG MODE: Stack will not wait for signal, allowing manual troubleshooting"
+                
+                # In debug mode, provide diagnostic information
+                echo "=== DEBUG INFORMATION ==="
+                echo "Instance ID: $(TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H 'X-aws-ec2-metadata-token-ttl-seconds: 60') && curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)"
+                echo "ECS Cluster: ${ECSCluster}"
+                echo "Docker Status: $(systemctl is-active docker)"
+                echo "=== ECS Configuration ==="
+                cat /etc/ecs/ecs.config
+                echo "=== End DEBUG INFORMATION ==="
+            fi
+            
+            echo "User data script completed at $(date) with exit code: $signal_result"
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub '${ProjectName}-${Environment}-ecs-instance'
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: 
+      - ECSCluster  # Ensure ECS cluster is created before ASG
+      - ECRVPCEndpoint  # Ensure ECR access is available
+      - ECRAPIVPCEndpoint  # Ensure ECR API access is available
+      - CloudFormationVPCEndpoint  # Ensure CloudFormation signaling works
+      - LogsVPCEndpoint  # Ensure logging works
+      - DefaultPrivateRoute1  # Ensure routing is configured
+      - DefaultPrivateRoute2  # Ensure routing is configured
+    Properties:
+      AutoScalingGroupName: !Sub '${ProjectName}-${Environment}-ecs-asg'
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ECSLaunchTemplate
+        Version: !GetAtt ECSLaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinSize
+      MaxSize: !Ref MaxSize
+      DesiredCapacity: !Ref DesiredCapacity
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 600  # Increase grace period for GPU instances
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-ecs-instance'
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref ProjectName
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+    CreationPolicy:
+      ResourceSignal:
+        Count: !If [WaitForSignals, !Ref DesiredCapacity, 0]
+        Timeout: PT45M  # Increased to 45 minutes for large container images (11GB+)
+
+  # VPC Endpoints for AWS Services (cost optimization)
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable1
+        - !Ref PrivateRouteTable2
+
+  ECRVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  ECRAPIVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  LogsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # CloudFormation VPC Endpoint for cfn-signal
+  CloudFormationVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.cloudformation'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${ProjectName}-${Environment}-vpc-endpoint-sg'
+      GroupDescription: Security group for VPC endpoints
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-vpc-endpoint-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  # VPC Outputs
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC'
+
+  PrivateSubnet1Id:
+    Description: Private subnet 1 ID
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1'
+
+  PrivateSubnet2Id:
+    Description: Private subnet 2 ID
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2'
+
+  PublicSubnet1Id:
+    Description: Public subnet 1 ID
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1'
+
+  PublicSubnet2Id:
+    Description: Public subnet 2 ID
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2'
+
+  # Security Group Outputs
+  ECSSecurityGroupId:
+    Description: ECS security group ID
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSSecurityGroupId'
+
+  ALBSecurityGroupId:
+    Description: ALB security group ID
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  # ECS Outputs
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterName'
+
+  ECSClusterArn:
+    Description: ECS cluster ARN
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterArn'
+
+  # Auto Scaling Group Output
+  AutoScalingGroupName:
+    Description: Auto Scaling Group name
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupName'
+
+  AutoScalingGroupArn:
+    Description: Auto Scaling Group ARN
+    Value: !Sub 'arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AutoScalingGroup}'
+    Export:
+      Name: !Sub '${AWS::StackName}-AutoScalingGroupArn'

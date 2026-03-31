@@ -1,0 +1,484 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MinerU ECS Compute Services - ECS Services and Task Definitions with GPU Support'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mineru-ecs
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+
+  # Import from other stacks
+  DataStackName:
+    Type: String
+    Description: Name of the data services stack to import resources from
+    Default: mineru-ecs-data-services-production
+
+  InfraStackName:
+    Type: String
+    Description: Name of the infrastructure stack to import resources from
+    Default: mineru-ecs-infrastructure-production
+
+  # ECS Configuration
+  DesiredCount:
+    Type: Number
+    Default: 1
+    Description: Desired number of ECS tasks
+    MinValue: 0
+    MaxValue: 10
+
+  StartupMode:
+    Type: String
+    Default: 'prewarmed'
+    AllowedValues: ['prewarmed', 'on-demand']
+    Description: |
+      prewarmed: Keep containers running for fast response (higher cost)
+      on-demand: Start containers only when needed (lower cost, slower response)
+
+  TaskCpu:
+    Type: Number
+    Default: 3072
+    Description: CPU units for the task (1024 = 1 vCPU)
+    AllowedValues: [256, 512, 1024, 2048, 3072, 4096]
+
+  TaskMemory:
+    Type: Number
+    Default: 12288
+    Description: Memory for the task in MB (MinerU v3 hybrid-auto-engine requires 16GB+ system RAM)
+    AllowedValues: [512, 1024, 2048, 3072, 4096, 5120, 6144, 7168, 8192, 10240, 12288, 16384]
+
+  # GPU Configuration
+  UseGPUResources:
+    Type: String
+    Default: 'true'  # 默认启用GPU
+    AllowedValues: ['true', 'false']
+    Description: Whether to use GPU resources for tasks
+    
+  # Container Configuration
+  ContainerImage:
+    Type: String
+    Default: public.ecr.aws/b1v8r5t6/mineru-ecs-gpu:latest
+    Description: Docker image for MinerU container
+
+  LogRetentionDays:
+    Type: Number
+    Default: 7
+    Description: CloudWatch log retention in days
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  UseGPU: !Equals [!Ref UseGPUResources, 'true']
+  PrewarmedMode: !Equals [!Ref StartupMode, 'prewarmed']
+
+Resources:
+  # ECS Capacity Provider
+  # Custom Resource to get the correct Auto Scaling Group ARN
+  GetAutoScalingGroupArn:
+    Type: Custom::GetAutoScalingGroupArn
+    Properties:
+      ServiceToken: !GetAtt GetAutoScalingGroupArnFunction.Arn
+      AutoScalingGroupName: 
+        Fn::ImportValue: !Sub '${InfraStackName}-AutoScalingGroupName'
+
+  # Lambda function to get Auto Scaling Group ARN
+  GetAutoScalingGroupArnFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-get-asg-arn'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt GetAutoScalingGroupArnRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          
+          def lambda_handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  autoscaling = boto3.client('autoscaling')
+                  asg_name = event['ResourceProperties']['AutoScalingGroupName']
+                  
+                  response = autoscaling.describe_auto_scaling_groups(
+                      AutoScalingGroupNames=[asg_name]
+                  )
+                  
+                  if response['AutoScalingGroups']:
+                      asg_arn = response['AutoScalingGroups'][0]['AutoScalingGroupARN']
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'AutoScalingGroupArn': asg_arn
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # Role for the Lambda function
+  GetAutoScalingGroupArnRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-get-asg-arn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AutoScalingReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ECSCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    DependsOn: GetAutoScalingGroupArn
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-capacity-provider'
+      AutoScalingGroupProvider:
+        # 使用 Custom Resource 获取的正确 ARN
+        AutoScalingGroupArn: !GetAtt GetAutoScalingGroupArn.AutoScalingGroupArn
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 100
+          MinimumScalingStepSize: 1
+          MaximumScalingStepSize: 2
+        ManagedTerminationProtection: DISABLED
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Log Group
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Role (for application permissions)
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource:
+                  - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-processing-queue'
+                  - !Sub 'arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ProjectName}-${Environment}-processing-dlq'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${Environment}-processing-jobs'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-${Environment}-processing-jobs/index/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:ListAllMyBuckets
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-data-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-data-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/${ProjectName}-${Environment}*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Task Definition
+  MinerUTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-mineru'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - EC2
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: mineru-processor
+          Image: !Ref ContainerImage
+          Essential: true
+          Memory: !Ref TaskMemory
+          Cpu: !Ref TaskCpu
+          # 条件性GPU资源要求
+          ResourceRequirements: !If
+            - UseGPU
+            - - Type: GPU
+                Value: '1'
+            - !Ref 'AWS::NoValue'
+          Environment:
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: SQS_QUEUE_URL
+              Value: !Sub 'https://sqs.${AWS::Region}.amazonaws.com/${AWS::AccountId}/${ProjectName}-${Environment}-processing-queue'
+            - Name: DYNAMODB_TABLE
+              Value: !Sub '${ProjectName}-${Environment}-processing-jobs'
+            - Name: BUCKET_NAME
+              Value: !Sub '${ProjectName}-${Environment}-data-${AWS::AccountId}'
+            - Name: PROJECT_NAME
+              Value: !Ref ProjectName
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: MINERU_MODEL_SOURCE
+              Value: local
+            - Name: MINERU_BACKEND
+              Value: hybrid-auto-engine
+            - Name: MINERU_DEVICE_MODE
+              Value: cuda
+            - Name: PYTHONUNBUFFERED
+              Value: '1'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: mineru-processor
+          WorkingDirectory: /app
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ECS Service (simplified with built-in retry mechanism)
+  MinerUService:
+    Type: AWS::ECS::Service
+    DependsOn: ECSCapacityProvider
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-mineru-service'
+      Cluster:
+        Fn::ImportValue: !Sub '${InfraStackName}-ECSClusterName'
+      TaskDefinition: !Ref MinerUTaskDefinition
+      DesiredCount: !If [PrewarmedMode, !Ref DesiredCount, 0]  # 根据启动模式设置
+      LaunchType: EC2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub '${InfraStackName}-ECSSecurityGroupId'
+          Subnets:
+            - Fn::ImportValue: !Sub '${InfraStackName}-PrivateSubnet1'
+            - Fn::ImportValue: !Sub '${InfraStackName}-PrivateSubnet2'
+          AssignPublicIp: DISABLED
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0  # 允许所有任务暂时不可用，适合初始部署
+      HealthCheckGracePeriodSeconds: 900  # 15分钟，给34GB+镜像首次拉取留足时间
+      EnableExecuteCommand: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Auto Scaling Target
+  ServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: 10
+      MinCapacity: 0
+      ResourceId: !Sub
+        - 'service/${ClusterName}/${ServiceName}'
+        - ClusterName:
+            Fn::ImportValue: !Sub '${InfraStackName}-ECSClusterName'
+          ServiceName: !GetAtt MinerUService.Name
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  # Auto Scaling Policy - Scale Up
+  ServiceScalingPolicyUp:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-scale-up'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 300
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 1
+
+  # Auto Scaling Policy - Scale Down
+  ServiceScalingPolicyDown:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${ProjectName}-${Environment}-scale-down'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 300
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: -1
+
+  # CloudWatch Alarm - High Queue Depth
+  HighQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-high-queue-depth'
+      AlarmDescription: 'Alarm when SQS queue depth is high'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '${ProjectName}-${Environment}-processing-queue'
+      AlarmActions:
+        - !Ref ServiceScalingPolicyUp
+
+  # CloudWatch Alarm - Low Queue Depth
+  LowQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-${Environment}-low-queue-depth'
+      AlarmDescription: 'Alarm when SQS queue depth is low'
+      MetricName: ApproximateNumberOfVisibleMessages
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 2
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '${ProjectName}-${Environment}-processing-queue'
+      AlarmActions:
+        - !Ref ServiceScalingPolicyDown
+
+Outputs:
+  # ECS Capacity Provider Output
+  ECSCapacityProviderName:
+    Description: ECS capacity provider name
+    Value: !Ref ECSCapacityProvider
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSCapacityProviderName'
+
+  # ECS Service Outputs
+  ECSServiceName:
+    Description: ECS service name
+    Value: !Ref MinerUService
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSServiceName'
+
+  ECSServiceArn:
+    Description: ECS service ARN
+    Value: !Ref MinerUService
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSServiceArn'
+
+  # Task Definition Outputs
+  TaskDefinitionArn:
+    Description: ECS task definition ARN
+    Value: !Ref MinerUTaskDefinition
+    Export:
+      Name: !Sub '${AWS::StackName}-TaskDefinitionArn'
+
+  # Log Group Output
+  LogGroupName:
+    Description: CloudWatch log group name
+    Value: !Ref ECSLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-LogGroupName'

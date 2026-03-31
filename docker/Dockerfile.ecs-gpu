@@ -1,0 +1,96 @@
+# MinerU v3 ECS GPU镜像 - 基于vllm官方镜像（MinerU推荐）
+# vllm镜像已包含PyTorch + CUDA + vllm，适合hybrid-auto-engine后端
+FROM vllm/vllm-openai:v0.11.2
+
+# 设置环境变量 - GPU模式
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONFAULTHANDLER=1 \
+    MINERU_DEVICE_MODE=cuda \
+    MINERU_MODEL_SOURCE=local \
+    MINERU_ENABLE_GPU=true \
+    MINERU_VIRTUAL_VRAM_SIZE=14000 \
+    MINERU_LOG_LEVEL=INFO \
+    MINERU_BACKEND=hybrid-auto-engine \
+    CLEANUP_FILES=false \
+    CUDA_VISIBLE_DEVICES=0
+
+# 添加镜像元数据
+LABEL maintainer="MinerU Team" \
+      description="MinerU v3 ECS GPU镜像 - hybrid-auto-engine后端" \
+      version="3.0" \
+      mineru_version="3.0.1"
+
+# 安装系统依赖
+RUN apt-get update && apt-get install -y \
+    # OpenGL和图像处理依赖
+    libgl1-mesa-glx \
+    libgl1 \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender-dev \
+    libgomp1 \
+    # PDF处理依赖
+    poppler-utils \
+    # 字体支持
+    fonts-noto-core \
+    fonts-noto-cjk \
+    fontconfig \
+    # 基础工具
+    ca-certificates \
+    curl \
+    && fc-cache -fv \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建工作目录
+WORKDIR /app
+
+# 安装MinerU v3完整版（含VLM和pipeline支持）
+# --break-system-packages 因为vllm基础镜像使用系统Python
+RUN python3 -m pip install -U 'mineru[core]>=3.0.0' --break-system-packages && \
+    python3 -m pip cache purge
+
+# 安装ECS应用额外依赖
+RUN python3 -m pip install --break-system-packages --no-cache-dir --ignore-installed \
+    boto3>=1.28.43 \
+    structlog>=23.2.0 \
+    prometheus-client>=0.19.0 \
+    flask>=3.0.0 \
+    gunicorn>=21.2.0 \
+    psutil>=5.9.6 \
+    humanize>=4.8.0 \
+    tenacity>=8.2.3 \
+    albumentations && \
+    python3 -m pip install --break-system-packages "numpy<2.3"
+
+# 下载模型文件（pipeline + VLM模型，支持hybrid-auto-engine）
+RUN /bin/bash -c "for i in {1..3}; do \
+        echo \"Downloading models (attempt \$i)\" && \
+        timeout 600 mineru-models-download -s huggingface -m all && break || \
+        echo \"Download failed, retrying...\" && sleep 10; \
+    done" || echo "Model download will be done at runtime"
+
+# 验证MinerU安装
+RUN python3 -c "from mineru.version import __version__; print(f'MinerU version: {__version__}')" && \
+    python3 -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA compiled: {torch.version.cuda}')" && \
+    python3 -c "import vllm; print(f'vLLM available')" || echo "vLLM verification deferred to runtime"
+
+# 复制应用代码
+COPY app/ .
+
+# 设置脚本权限
+RUN chmod +x /app/entrypoint.sh
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# 暴露端口
+EXPOSE 8080
+
+# 设置入口点
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["python3", "main.py"]

@@ -1,0 +1,9 @@
+Sample: MinerU on AWS ECS with GPU Acceleration
+Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+This product includes software developed by:
+- OpenDataLab (MinerU) - https://github.com/opendatalab/MinerU
+- The Python Software Foundation (Python) - https://www.python.org/
+- NVIDIA Corporation (CUDA) - https://developer.nvidia.com/cuda-zone
+
+Third-party licenses are included in the THIRD-PARTY-LICENSES file.

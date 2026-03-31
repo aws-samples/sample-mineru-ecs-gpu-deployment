@@ -1,0 +1,534 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MinerU ECS S3 Event Trigger Services - Automatic document processing'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mineru-ecs
+    Description: Project name for resource naming
+  
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+
+  # Import from other stacks
+  DataStackName:
+    Type: String
+    Description: Name of the data services stack to import resources from
+    Default: mineru-ecs-data-services-production
+
+  InfraStackName:
+    Type: String
+    Description: Name of the infrastructure stack to import resources from
+    Default: mineru-ecs-infrastructure-production
+
+Resources:
+  # Lambda execution role
+  ProcessingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-processing-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectMetadata
+                Resource:
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-ProcessingQueueArn'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-JobsTableArn'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function to process S3 events
+  S3ProcessingTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-s3-trigger'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt ProcessingLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SQS_QUEUE_URL:
+            Fn::ImportValue: !Sub '${DataStackName}-ProcessingQueueUrl'
+          DYNAMODB_TABLE:
+            Fn::ImportValue: !Sub '${DataStackName}-JobsTableName'
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+          from urllib.parse import unquote_plus
+
+          sqs = boto3.client('sqs')
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              queue_url = os.environ['SQS_QUEUE_URL']
+              table_name = os.environ['DYNAMODB_TABLE']
+              table = dynamodb.Table(table_name)
+              
+              for record in event['Records']:
+                  # 只处理 ObjectCreated 事件
+                  if not record['eventName'].startswith('ObjectCreated'):
+                      continue
+                      
+                  bucket = record['s3']['bucket']['name']
+                  key = unquote_plus(record['s3']['object']['key'])
+                  
+                  # 跳过非文档文件
+                  if not is_document_file(key):
+                      print(f"Skipping non-document file: {key}")
+                      continue
+                  
+                  # 生成任务ID
+                  job_id = str(uuid.uuid4())
+                  
+                  # 创建处理任务记录
+                  try:
+                      table.put_item(
+                          Item={
+                              'job_id': job_id,
+                              'status': 'QUEUED',
+                              'data_bucket': bucket,
+                              'data_key': key,
+                              'input_bucket': bucket,
+                              'input_key': key,
+                              'created_at': datetime.utcnow().isoformat(),
+                              'updated_at': datetime.utcnow().isoformat()
+                          }
+                      )
+                      
+                      # 发送消息到SQS队列
+                      message = {
+                          'job_id': job_id,
+                          'data_bucket': bucket,
+                          'data_key': key,
+                          'input_bucket': bucket,
+                          'input_key': key,
+                          'output_prefix': f"processed/{job_id}/",
+                          'timestamp': datetime.utcnow().isoformat()
+                      }
+                      
+                      sqs.send_message(
+                          QueueUrl=queue_url,
+                          MessageBody=json.dumps(message),
+                          MessageAttributes={
+                              'job_id': {
+                                  'StringValue': job_id,
+                                  'DataType': 'String'
+                              },
+                              'file_type': {
+                                  'StringValue': get_file_type(key),
+                                  'DataType': 'String'
+                              }
+                          }
+                      )
+                      
+                      print(f"Successfully queued job {job_id} for file {key}")
+                      
+                  except Exception as e:
+                      print(f"Error processing file {key}: {str(e)}")
+                      continue
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Processing completed')
+              }
+
+          def is_document_file(key):
+              """检查是否为支持的文档文件"""
+              supported_extensions = ['.pdf', '.docx', '.doc', '.txt', '.md', '.html']
+              return any(key.lower().endswith(ext) for ext in supported_extensions)
+
+          def get_file_type(key):
+              """获取文件类型"""
+              if key.lower().endswith('.pdf'):
+                  return 'pdf'
+              elif key.lower().endswith(('.docx', '.doc')):
+                  return 'word'
+              elif key.lower().endswith('.txt'):
+                  return 'text'
+              elif key.lower().endswith('.md'):
+                  return 'markdown'
+              elif key.lower().endswith('.html'):
+                  return 'html'
+              else:
+                  return 'unknown'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 bucket notification permission for Lambda
+  S3InvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref S3ProcessingTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: 
+        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+
+  # CloudWatch Log Group for Lambda
+  ProcessingLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${S3ProcessingTriggerFunction}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ========================================
+  # Post-Processing Lambda for MD files
+  # ========================================
+
+  # Lambda execution role for MD post-processing
+  MdPostProcessingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-md-postprocess-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 
+                    - '${BucketArn}/processed/*'
+                    - BucketArn:
+                        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda function to post-process MD files
+  MdPostProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-md-postprocess'
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Role: !GetAtt MdPostProcessingLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          CLOUDFRONT_DOMAIN:
+            Fn::ImportValue: !Sub '${DataStackName}-CloudFrontDomain'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import re
+          import os
+          import urllib.parse
+
+          s3_client = boto3.client('s3')
+          CLOUDFRONT_DOMAIN = os.environ['CLOUDFRONT_DOMAIN']
+
+          def lambda_handler(event, context):
+              # 获取触发事件的 S3 桶和对象键
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'])
+              
+              # 检查是否为 .md 文件
+              if not key.lower().endswith('.md'):
+                  print(f"跳过非 Markdown 文件: {key}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('非 Markdown 文件，已跳过处理')
+                  }
+              
+              try:
+                  # 从 S3 获取原始 Markdown 内容
+                  response = s3_client.get_object(Bucket=bucket, Key=key)
+                  content = response['Body'].read().decode('utf-8')
+                  
+                  # 获取文件夹路径
+                  folder_path = os.path.dirname(key)
+                  
+                  # 使用正则表达式查找并替换图片引用
+                  pattern = r'!\[(.*?)\]\(images/(.*?)\)'
+                  
+                  def replace_image_url(match):
+                      # 提取 alt text 和图片名称
+                      alt_text = match.group(1)
+                      image_name = match.group(2)
+                      
+                      # 构建 CloudFront URL
+                      cloudfront_url = f"https://{CLOUDFRONT_DOMAIN}/{folder_path}/images/{image_name}"
+                      
+                      # 返回完整的 Markdown 语法
+                      return f"![{alt_text}]({cloudfront_url})"
+                  
+                  # 应用替换
+                  modified_content = re.sub(pattern, replace_image_url, content)
+                  
+                  # 如果内容有更改，上传回 S3
+                  if content != modified_content:
+                      s3_client.put_object(
+                          Bucket=bucket,
+                          Key=key,
+                          Body=modified_content,
+                          ContentType='text/markdown'
+                      )
+                      print(f"成功更新文件: {key}")
+                      print(f"CloudFront Domain: {CLOUDFRONT_DOMAIN}")
+                  else:
+                      print(f"文件没有需要替换的图片引用: {key}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('处理成功')
+                  }
+              
+              except Exception as e:
+                  print(f"发生错误: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f'处理过程中发生错误: {str(e)}')
+                  }
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 bucket notification permission for MD post-processing Lambda
+  S3InvokeMdPostProcessingPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MdPostProcessingFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: 
+        Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+
+  # CloudWatch Log Group for MD post-processing Lambda
+  MdPostProcessingLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${MdPostProcessingFunction}'
+      RetentionInDays: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Custom resource to configure S3 notification
+  S3NotificationConfiguration:
+    Type: Custom::S3BucketNotification
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      BucketName:
+        Fn::ImportValue: !Sub '${DataStackName}-DataBucketName'
+      InputLambdaArn: !GetAtt S3ProcessingTriggerFunction.Arn
+      ProcessedLambdaArn: !GetAtt MdPostProcessingFunction.Arn
+
+  # Lambda function to configure S3 notifications
+  S3NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-s3-notification-config'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt S3NotificationRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          
+          s3 = boto3.client('s3')
+          
+          def lambda_handler(event, context):
+              try:
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  input_lambda_arn = event['ResourceProperties']['InputLambdaArn']
+                  processed_lambda_arn = event['ResourceProperties']['ProcessedLambdaArn']
+                  
+                  if event['RequestType'] in ['Create', 'Update']:
+                      # Configure S3 notification with two triggers
+                      notification_config = {
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'Id': 'InputProcessingTrigger',
+                                  'LambdaFunctionArn': input_lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {
+                                                  'Name': 'prefix',
+                                                  'Value': 'input/'
+                                              }
+                                          ]
+                                      }
+                                  }
+                              },
+                              {
+                                  'Id': 'MdPostProcessingTrigger',
+                                  'LambdaFunctionArn': processed_lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*'],
+                                  'Filter': {
+                                      'Key': {
+                                          'FilterRules': [
+                                              {
+                                                  'Name': 'prefix',
+                                                  'Value': 'processed/'
+                                              },
+                                              {
+                                                  'Name': 'suffix',
+                                                  'Value': '.md'
+                                              }
+                                          ]
+                                      }
+                                  }
+                              }
+                          ]
+                      }
+                      
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration=notification_config
+                      )
+                      
+                  elif event['RequestType'] == 'Delete':
+                      # Remove S3 notification
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name,
+                          NotificationConfiguration={}
+                      )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  # Role for S3 notification configuration Lambda
+  S3NotificationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-s3-notification-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketNotification
+                  - s3:PutBucketNotification
+                Resource:
+                  - Fn::ImportValue: !Sub '${DataStackName}-DataBucketArn'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # Lambda Function Outputs
+  ProcessingTriggerFunctionName:
+    Description: S3 processing trigger function name
+    Value: !Ref S3ProcessingTriggerFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingTriggerFunctionName'
+
+  ProcessingTriggerFunctionArn:
+    Description: S3 processing trigger function ARN
+    Value: !GetAtt S3ProcessingTriggerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingTriggerFunctionArn'
+
+  # Lambda Role Output
+  ProcessingLambdaRoleArn:
+    Description: Processing Lambda role ARN
+    Value: !GetAtt ProcessingLambdaRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingLambdaRoleArn'
+
+  # MD Post-Processing Lambda Outputs
+  MdPostProcessingFunctionName:
+    Description: MD post-processing function name
+    Value: !Ref MdPostProcessingFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-MdPostProcessingFunctionName'
+
+  MdPostProcessingFunctionArn:
+    Description: MD post-processing function ARN
+    Value: !GetAtt MdPostProcessingFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-MdPostProcessingFunctionArn'

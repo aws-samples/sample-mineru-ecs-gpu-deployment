@@ -1,0 +1,69 @@
+# MinerU ECS Cross-Account Deployment Configuration
+
+# Default configuration - applies to all accounts unless overridden
+default:
+  project_name: mineru-ecs
+  environment: production
+  aws_region: us-east-1
+  instance_type: g4dn.xlarge  # Use GPU instance as requested
+  min_size: 1
+  max_size: 2
+  desired_capacity: 1
+  volume_size: 200
+  task_cpu: 3072
+  task_memory: 12288
+  task_desired_count: 1
+  startup_mode: prewarmed
+  container_image: public.ecr.aws/b1v8r5t6/mineru-ecs-gpu:latest
+  log_retention_days: 7
+  use_gpu: true  # Enable GPU support
+  # Debug and troubleshooting options
+  debug_mode: false  # Set to true to prevent rollback and enable detailed logging
+  disable_rollback: false  # Set to true to disable automatic rollback on failure
+
+# Development environment
+development:
+  environment: development
+  instance_type: g4dn.xlarge
+  min_size: 0
+  max_size: 2
+  desired_capacity: 0
+  volume_size: 50
+  task_cpu: 3072
+  task_memory: 12288
+  task_desired_count: 0
+  startup_mode: on-demand
+  log_retention_days: 3
+  use_gpu: true
+
+# Staging environment
+staging:
+  environment: staging
+  instance_type: g4dn.xlarge
+  min_size: 1
+  max_size: 2
+  desired_capacity: 1
+  volume_size: 80
+  task_cpu: 3072
+  task_memory: 12288
+  task_desired_count: 1
+  startup_mode: prewarmed
+  log_retention_days: 7
+  use_gpu: true
+
+# Production environment
+production:
+  environment: production
+  aws_region: us-west-2
+  instance_type: g4dn.xlarge
+  min_size: 1
+  max_size: 2
+  desired_capacity: 1
+  volume_size: 200
+  task_cpu: 3072
+  task_memory: 12288
+  task_desired_count: 1
+  startup_mode: prewarmed
+  log_retention_days: 7
+  use_gpu: true
+

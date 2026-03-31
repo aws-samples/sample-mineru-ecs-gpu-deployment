@@ -1,0 +1,225 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'MinerU ECS Data Services - Simplified Version for Testing'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: mineru-ecs
+    Description: Project name for resource naming
+
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment name
+
+Resources:
+  # S3 bucket for data storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-data-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DynamoDB table for job tracking
+  ProcessingJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-processing-jobs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-created-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SQS queue for processing jobs
+  ProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-processing-queue'
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProcessingDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Dead Letter Queue
+  ProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-${Environment}-processing-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudFront Origin Access Identity
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${ProjectName}-${Environment}'
+
+  # S3 Bucket Policy to allow CloudFront access
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAI
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: 's3:GetObject'
+            Resource: !Sub '${DataBucket.Arn}/*'
+
+  # CloudFront Distribution for image serving
+  ImageCDN:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub '${ProjectName}-${Environment} Image CDN'
+        Enabled: true
+        HttpVersion: http2
+        PriceClass: PriceClass_100  # Use only North America and Europe
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt DataBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          MinTTL: 0
+          DefaultTTL: 86400      # 1 day
+          MaxTTL: 31536000       # 1 year
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # S3 Bucket Outputs
+  DataBucketName:
+    Description: S3 data bucket name
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketName'
+
+  DataBucketArn:
+    Description: S3 data bucket ARN
+    Value: !GetAtt DataBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DataBucketArn'
+
+  # DynamoDB Outputs
+  ProcessingJobsTableName:
+    Description: Processing jobs table name
+    Value: !Ref ProcessingJobsTable
+    Export:
+      Name: !Sub '${AWS::StackName}-JobsTableName'
+
+  ProcessingJobsTableArn:
+    Description: Processing jobs table ARN
+    Value: !GetAtt ProcessingJobsTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-JobsTableArn'
+
+  # SQS Outputs
+  ProcessingQueueUrl:
+    Description: Processing queue URL
+    Value: !Ref ProcessingQueue
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingQueueUrl'
+
+  ProcessingQueueArn:
+    Description: Processing queue ARN
+    Value: !GetAtt ProcessingQueue.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingQueueArn'
+
+  ProcessingDLQUrl:
+    Description: Processing dead letter queue URL
+    Value: !Ref ProcessingDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingDLQUrl'
+
+  ProcessingDLQArn:
+    Description: Processing dead letter queue ARN
+    Value: !GetAtt ProcessingDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessingDLQArn'
+
+  # CloudFront Outputs
+  CloudFrontDomainName:
+    Description: CloudFront distribution domain name
+    Value: !GetAtt ImageCDN.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDomain'
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref ImageCDN
+    Export:
+      Name: !Sub '${AWS::StackName}-CloudFrontDistributionId'
