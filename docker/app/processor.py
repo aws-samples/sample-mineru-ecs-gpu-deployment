@@ -281,6 +281,27 @@ class MinerUProcessor:
             f_dump_content_list=False,
         )
         
+        # 清理 vLLM 引擎单例，避免 EngineCore 子进程在后续任务中崩溃
+        # vLLM v0.11.x 的 EngineCore 使用 multiprocessing spawn，
+        # 长驻容器中引擎空闲后子进程可能进入不稳定状态
+        try:
+            from mineru.backend.vlm.vlm_analyze import ModelSingleton
+            singleton = ModelSingleton()
+            with singleton._lock:
+                for key, predictor in list(singleton._models.items()):
+                    try:
+                        if hasattr(predictor, 'llm') and predictor.llm is not None:
+                            del predictor.llm
+                        if hasattr(predictor, 'close'):
+                            predictor.close()
+                    except Exception:
+                        pass
+                singleton._models.clear()
+            torch.cuda.empty_cache()
+            logger.info("vLLM引擎单例已清理，下次任务将重新初始化")
+        except Exception as e:
+            logger.warning("vLLM引擎清理失败（非致命）", error=str(e))
+        
         processing_time = time.time() - start_time
         
         # 验证输出文件
